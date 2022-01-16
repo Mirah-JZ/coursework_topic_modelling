@@ -1,0 +1,544 @@
+---
+title: "policy frames"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=FALSE, echo = TRUE)
+```
+
+```{r}
+library(readtext)
+library(tm)
+library(parallel)
+library(matrixStats)
+library(XML)
+library(quanteda)
+library(quanteda.textmodels)
+library(quanteda.textplots)
+library(quanteda.textstats)
+library(stringi)
+library(stringr)
+library(reshape2)
+library(stm)
+library(lda)
+library(topicmodels)
+library(tidytext)
+library(textmineR)
+library(dplyr)
+library(tidyverse)
+library(DescTools)
+library(plm)
+library(stmCorrViz)
+library(ggplot2)
+library(ggraph)
+library(igraph)
+library(viridis)
+library(stargazer)
+```
+
+# import data
+
+## text data
+```{r}
+# load original 52675 doc corpus file (from total of 5265321 docs, chosen relevant 52675)
+# processing done: remove punctuation, number, white space, stem, stop words ("said", "say", "one", "can", "will").
+
+load(file = "corpus_txt.RData") # 52675 paragraphs. each around 100 words.
+
+# more processing needed: 
+# Must: filtering lowest/ highest frequency words, to lower case, remove URL, remove more custom words ('smoke', 'ban', 'city', 'bill').
+# Maybe: is it possible to concat paragraphs of same article into one doc? also informative to do topic co-occurrence at article level.
+```
+
+
+# Topic modelling
+## aggregate to article level, add year feature to text
+in meta data, seem that there is article ref number. each article is then sub-scripted to 2-20 paragraphs. e.g. "AlbuquerqueJournal-1996-01-05-201-5"
+if group by article. 
+(1) will full articles be too long for topic models? 
+(2) will varying length be a problem? most likely yes, because docs with varying length will have very different topic composition, and the 'length' along is not good enough to parameterise that variation across documents. 
+(3) will text embedding help with varying length? BERT and LSTM has no problem with varying doc length, but application in topic modelling is limited. related approaches, building knowledge graph from text embedding models, topic and topic co-occurrence as community detection on graph.
+
+```{r}
+# add year of pub and article ref to meta (later as docvar)
+meta <- corpus$meta
+
+year <- meta$path
+year <- as.data.frame(t(as.data.frame(str_split(year,"-"))))
+year <- select(year,c(2))
+year <- as.vector(year)
+meta$year <- year[,1]
+
+article <- meta$path
+article <- as.data.frame(t(as.data.frame(str_split(article,"-"))))
+article <- select(article,c(2:5))
+colnames(article)=c("v1","v2","v3","v4")
+article <- article %>% mutate(.,article=paste0(v1,v2,v3,v4))# get unique article id
+article <- select(article,c("article"))
+meta <- cbind(meta,article)
+meta <- select(meta,c(3,4,5,6,8,9,15,16,17,18))
+
+meta$id <- rownames(meta)
+ 
+#save(meta,file="total_meta.Rdata")
+```
+
+```{r}
+# sampling from entire meta at article level
+# for robustness, repeat analysis procedure with random sampled n% of texts
+load(file="total_meta.Rdata")
+
+article_id <- meta$article %>% unique(.) # 27655 unique articles
+article_sample <- sample(article_id,5000)
+meta_sample <- meta %>% filter(.,article%in%article_sample) # down to 9474 paras. on average 2 paras per article ??? seems to little
+#save(meta_sample,file="article5000_sample_meta.Rdata")
+
+```
+
+
+```{r}
+# pasting paras from same article together
+meta2 <- meta_sample %>% 
+  group_by(article)%>% 
+  mutate(text2 = paste0(text,collapse="")) %>% 
+  select(.,-c("text"))%>% rename("text"="text2")
+
+meta2 <- distinct(meta2, article, .keep_all=TRUE) # keeping 5000 unique rows corresponding to articles.
+#save(meta2,file=("sample_meta_5000grouped.Rdata"))
+
+load(file="sample_meta_5000grouped.Rdata")
+```
+
+
+## process text, make quanteda corpus file, to tokens, to dfm.
+```{r}
+vars <- select(meta2,-c(7)) # delete "path"
+corpus_all <- corpus(meta2$text,docnames=meta2$id, docvars=vars) 
+
+# subset corpus by year
+corpus_96 <- corpus_subset(corpus_all,year%in%c("1996","1997","1998")) # 592 doc
+corpus_05 <- corpus_subset(corpus_all,year%in%c("2004","2005")) # 833 doc
+corpus_13 <- corpus_subset(corpus_all,year%in%c("2011","2012","2013")) # 489 doc
+
+# subset corpus by media slant [0.32,0.59], higher slant means more conservative.
+# media slant score positively correlates with conservative score. 
+# thresholds set so that each sub-corpus has around 100 docs.
+
+#corpus_left <- corpus_subset(corpus_all,slant<0.43)
+#corpus_right <- corpus_subset(corpus_all,slant>0.48)
+
+corpus_96_left <- corpus_subset(corpus_96,slant<0.415)
+corpus_96_right <- corpus_subset(corpus_96,slant>0.48)
+#corpus_96_m <- corpus_subset(corpus_96,slant<0.48&slant>0.42)
+
+corpus_05_left <- corpus_subset(corpus_05,slant<0.413)
+corpus_05_right <- corpus_subset(corpus_05,slant>0.49)
+#corpus_05_m <- corpus_subset(corpus_05,slant<0.48&slant>0.43)
+
+corpus_13_left <- corpus_subset(corpus_13,slant<0.425)
+corpus_13_right <- corpus_subset(corpus_13,slant>0.48)
+#corpus_13_m <- corpus_subset(corpus_13,slant<0.48&slant>0.41)
+
+# tokens all and by years
+custom_toks <- function (t){
+  t <- tokens(t,remove_numbers=TRUE,remove_punct=TRUE,remove_symbols=TRUE,remove_separators=TRUE,remove_url = TRUE,split_hyphens=TRUE,verbose=TRUE) 
+  t <- tokens_tolower(t)
+  t <- tokens_remove(t, pattern = stopwords('en'), min_nchar=4)
+  t <- tokens_wordstem(t)
+  t <- tokens_remove(t, pattern = c("smoke","ban","citi","bill"))
+}
+
+toks <- custom_toks(corpus_all)
+toks96 <- custom_toks(corpus_96)
+toks05 <- custom_toks(corpus_05)
+toks13 <- custom_toks(corpus_13)
+
+toks96left <- custom_toks(corpus_96_left)
+toks96right <- custom_toks(corpus_96_right)
+toks05left <- custom_toks(corpus_05_left)
+toks05right <- custom_toks(corpus_05_right)
+toks13left <- custom_toks(corpus_13_left)
+toks13right <- custom_toks(corpus_13_right)
+
+# document-feature matrix
+custom_dfm <- function (t){
+  t <- dfm(t)
+  t <- dfm_trim(t, min_docfreq = .01, max_docfreq = .95, docfreq_type = "prop", verbose=TRUE)
+  emptytexts <- which(ntoken(t)==0)
+  t <- dfm_subset(t, ntoken(t) > 0)
+}
+
+dfmall <- custom_dfm(toks) 
+dfm96 <- custom_dfm(toks96)
+dfm05 <- custom_dfm(toks05)
+dfm13 <- custom_dfm(toks13)
+
+dfm96l <- custom_dfm(toks96left)
+dfm96r <- custom_dfm(toks96right)
+dfm05l <- custom_dfm(toks05left)
+dfm05r <- custom_dfm(toks05right)
+dfm13l <- custom_dfm(toks13left)
+dfm13r <- custom_dfm(toks13right)
+```
+
+## topic modeling: stm, lda
+```{r}
+# stm 
+stm_all <- stm(dfmall, K=20, prevalence=~year+as.factor(paper) + smokers + unifiedDemocrats + unifiedRepublicans + producer + slant, seed=123) # 5 min run time
+stm_96 <- stm(dfm96, K=12, prevalence=~as.factor(paper) + smokers + unifiedDemocrats + unifiedRepublicans + producer + slant, seed=123)
+stm_05 <- stm(dfm05, K=12, prevalence=~as.factor(paper) + smokers + unifiedDemocrats + unifiedRepublicans + producer + slant, seed=123)
+stm_13 <- stm(dfm13, K=12, prevalence=~as.factor(paper) + smokers + unifiedDemocrats + unifiedRepublicans + producer + slant, seed=123)
+
+#summary(stm_all)
+#summary(stm_96l)
+#summary(stm_05)
+#summary(stm_13)
+
+# lda
+#lda_all <- LDA(dfmall,k=12,methods="VEM", seed=123)
+lda_96 <- LDA(dfm96,k=12,methods="VEM", seed=123)
+lda_05 <- LDA(dfm05,k=12,methods="VEM", seed=123)
+lda_13 <- LDA(dfm13,k=12,methods="VEM", seed=123)
+
+lda_96l <- LDA(dfm96l,k=6,methods="VEM", seed=123)
+lda_05l <- LDA(dfm05l,k=6,methods="VEM", seed=123)
+lda_13l <- LDA(dfm13l,k=6,methods="VEM", seed=123) # something wrong with this model. has it converged? topic pervalence is basically flat over documents
+
+lda_96r <- LDA(dfm96r,k=6,methods="VEM", seed=123)
+lda_05r <- LDA(dfm05r,k=6,methods="VEM", seed=123)
+lda_13r <- LDA(dfm13r,k=6,methods="VEM", seed=123)
+
+#terms(lda_96,k=12)
+
+```
+
+# topic co-occurrence
+## STM topic positive correlation (co-occurrence)
+```{r}
+# stm topic corr
+to12 <- c("topic1","topic2","topic3","topic4","topic5","topic6","topic7","topic8","topic9","topic10","topic11","topic12")
+to6 <- c("topic1","topic2","topic3","topic4","topic5","topic6")
+
+load(file="x1.Rdata")
+load(file="x2.Rdata")
+load(file="y1.Rdata")
+load(file="y2.Rdata")
+# first plot a graph, get its x, y coordinates to input to later graphs so they have the same layout.
+#p <- ggraph(g,layout=layout_with_fr(g))
+#coor <- p$data
+#x1 <- coor$x
+#y1 <- coor$y
+
+# function to calculate STM topic correlation and plot it
+custom_corrplot_stm <- function(t){
+    mat <-topicCorr(t,method=c("simple"),cutoff=0.01)[[2]] # positive corr
+    colnames(mat) <- to12
+    
+    g <- graph_from_adjacency_matrix(mat,mode=c("undirected"),weighted=TRUE)
+    V(g)$size <- graph.strength(g,mode="all")
+
+    p <- ggraph(g,layout="manual",x=x1, y=y1)+
+         geom_edge_link(aes(edge_width = weight),edge_colour = "grey66")+
+         scale_edge_width(range = c(0.03,2.5))+
+         geom_node_point(aes(size=size),shape = 19,color="pink")+
+         geom_node_text(aes(filter = size >= 2, label = name))+
+         scale_edge_color_manual(values=c(rgb(0,0,0,0.3),rgb(0,0,0,1)))+
+         theme_graph()+
+         theme()
+}
+```
+
+```{r}
+# alternative: function to calculate STM topic correlation and plot it
+
+get_topic_od_stm <- function(to,m,n,r,k){
+  # params: # to: topic labels, string, 
+            # m: stm model, list object, 
+            # n: number of documents in the model, integer, (can just use length(m$theta[,1]) for stm, not lda)
+            # r: threshold below which to drop topics as doc feature.check gamma matrix to decide
+            # K: number of topics.
+  # output: k by k topic_od matrix
+ 
+  topic_od <- matrix(nrow= k,ncol= k)
+  colnames(topic_od) <- to
+  
+  # get doc-topic theta matrix
+  thetas <-m$theta
+  colnames(thetas) <- to
+  
+  # in doc-topic matrix, filter out topics below threshold r
+  # threshold r is set, so that only co-occurrence where both topics are important above r are counted.
+  for (i in 1:n){
+      for (j in 1:k){
+        if (thetas[i,j]< r)
+        {thetas[i,j] <- 0}
+      }
+  }
+  
+  # taking product of col pairs (i.e. topic pairs) in the doc-topic matrix (aka. doc-feature matrix), 
+  # counting the number of nonzero elements in the product, i.e. the number of docs with co-occurrence for the pair of topics.
+    for (i in 1:k){
+      for (j in 1:k){
+        if (i!=j){
+          t <- thetas[,i]*thetas[,j]
+          topic_od[i,j] <- sum(t!=0)
+        }
+        if (i==j) {
+          topic_od[i,j] <- 0
+        }
+      }
+    }
+  topic_od
+}
+
+custom_corrplot_stmlda <- function(t){
+    # param: topic_od matrix
+    # output: topic co-occurrence graph
+    set.seed(123)
+    g <- graph_from_adjacency_matrix(t,mode=c("undirected"),weighted=TRUE)
+    V(g)$size <- graph.strength(g,mode="all")
+
+    p <- ggraph(g,layout="manual",x=x1, y=y1)+
+         geom_edge_link(aes(edge_width = weight),edge_colour = "grey66")+
+         scale_edge_width(range = c(0.005,1.6))+
+         geom_node_point(aes(size=size),shape = 19,color="pink")+
+         geom_node_text(aes(filter = size >= 2, label = name))+
+         scale_edge_color_manual(values=c(rgb(0,0,0,0.3),rgb(0,0,0,1)))+
+         theme_graph()+
+         theme()
+}
+
+topic_od_96stm <- get_topic_od_stm(to12, stm_96, 591,0.2, 12)
+topic_od_05stm <- get_topic_od_stm(to12, stm_05, 833,0.2, 12)
+topic_od_13stm <- get_topic_od_stm(to12, stm_13, 489,0.2, 12)
+
+```
+
+## STM co-occurrence visualisation
+```{r}
+# plotting stm positive corr with method in stm package
+# found no clear difference between the years
+#p_stm_all <- custom_corrplot(stm_all)
+p_stm_96 <- custom_corrplot_stm(stm_96)
+p_stm_05 <- custom_corrplot_stm(stm_05)
+p_stm_13 <- custom_corrplot_stm(stm_13)
+
+png('stm_96.png')
+p_stm_96
+dev.off()
+png('stm_05.png')
+p_stm_05
+dev.off()
+png('stm_13.png')
+p_stm_13
+dev.off()
+```
+
+
+```{r}
+# plotting stm with alternative counting method
+p_stm_96alt <- custom_corrplot_stmlda(topic_od_96stm)
+p_stm_05alt <- custom_corrplot_stmlda(topic_od_05stm)
+p_stm_13alt <- custom_corrplot_stmlda(topic_od_13stm)
+
+png('stm_96alt.png')
+p_stm_96alt
+dev.off()
+png('stm_05alt.png')
+p_stm_05alt
+dev.off()
+png('stm_13alt.png')
+p_stm_13alt
+dev.off()
+
+```
+
+
+## LDA topic co-ooccurrence
+```{r}
+# LDA topic co-occurrence
+# beta: p(word|topic), gamma: p(topic|doc)
+
+get_topic_od_lda <- function(to,m,n,r,k){
+  # params: # to: topic labels, string, 
+            # m: lda model, LDA object, 
+            # n: number of documents in the model, integer, 
+            # r: threshold below which to drop topics as doc feature.check gamma matrix to decide
+            # K: number of topics.default 12.
+  # output: k by k topic_od matrix
+ 
+  topic_od <- matrix(nrow= k,ncol= k)
+  colnames(topic_od) <- to
+  
+  # get gamma matrix, pivot wider to doc-topcGamma matrix
+  gam <- as.data.frame(tidy(m,matrix=c("gamma")))
+  gam <- pivot_wider(gam, names_from="topic",values_from="gamma")
+  gam <- select(gam,-c(1))
+  
+  # in doc-topic matrix, filter out topics below threshold r
+  for (i in 1:n){
+      for (j in 1:k){
+        if (gam[i,j]< r)
+        {gam[i,j] <- 0}
+      }
+  }
+  
+  # taking product of col pairs (i.e. topic pairs) in the doc-topic matrix (aka. doc-feature matrix), 
+  # counting the number of nonzero elements in the product.
+    for (i in 1:k){
+      for (j in 1:k){
+        if (i!=j){
+          t <- gam[,i]*gam[,j]
+          topic_od[i,j] <- sum(t!=0)
+        }
+        if (i==j) {
+          topic_od[i,j] <- 0
+        }
+      }
+    }
+  topic_od
+}
+
+# check range of prevelence to choose r, check dimension n is correct
+gam <- tidy(lda_05r,matrix=c("gamma"))
+gam <- pivot_wider(gam, names_from="topic",values_from="gamma")
+
+# threshhold chosen at top 4-5 topics per doc, top 25% topics over corpus 0.08385
+#topic_od_all <- get_topic_od(to12, lda_all, 4710, 0.085, 12)
+topic_od_96 <- get_topic_od_lda(to12, lda_96, 591,0.085, 12)
+topic_od_05 <- get_topic_od_lda(to12, lda_05, 833,0.085, 12)
+topic_od_13 <- get_topic_od_lda(to12, lda_13, 489,0.085, 12)
+
+topic_od_96l <- get_topic_od_lda(to6, lda_96l, 110,0.001, 6)
+topic_od_05l <- get_topic_od_lda(to6, lda_05l, 78,0.001, 6)
+#topic_od_13l <- get_topic_od_lda(to6, lda_13l, 86,0.0006, 6)
+topic_od_13l <- get_topic_od_lda(to6, lda_13l, 101,0.001, 6)
+
+topic_od_96r <- get_topic_od_lda(to6, lda_96r, 96,0.001, 6)
+topic_od_05r <- get_topic_od_lda(to6, lda_05r, 105,0.001, 6)
+topic_od_13r <- get_topic_od_lda(to6, lda_13r, 112,0.001, 6)
+
+```
+
+## LDA co-occurrence visualisation
+```{r}
+# LDA model topic co-occurrence graphs
+
+#p_lda_all <- custom_corrplot_lda(topic_od_all)
+p_lda_96 <- custom_corrplot_stmlda(topic_od_96)
+p_lda_05 <- custom_corrplot_stmlda(topic_od_05)
+p_lda_13 <- custom_corrplot_stmlda(topic_od_13)
+
+p_lda_96l <- custom_corrplot_stmlda(topic_od_96l)
+p_lda_05l <- custom_corrplot_stmlda(topic_od_05l)
+p_lda_13l <- custom_corrplot_stmlda(topic_od_13l)
+
+p_lda_96r <- custom_corrplot_stmlda(topic_od_96r)
+p_lda_05r <- custom_corrplot_stmlda(topic_od_05r)
+p_lda_13r <- custom_corrplot_stmlda(topic_od_13r)
+
+# save img
+#png('lda_all.png')
+#p_lda_all
+#dev.off()
+png('lda_96.png')
+p_lda_96
+dev.off()
+png('lda_05.png')
+p_lda_05
+dev.off()
+png('lda_13.png')
+p_lda_13
+dev.off()
+
+png('lda_96l.png')
+p_lda_96l
+dev.off()
+png('lda_05l.png')
+p_lda_05l
+dev.off()
+png('lda_13l.png')
+p_lda_13l
+dev.off()
+png('lda_96r.png')
+p_lda_96r
+dev.off()
+png('lda_05r.png')
+p_lda_05r
+dev.off()
+png('lda_13r.png')
+p_lda_13r
+dev.off()
+
+```
+
+## measuring entropy of topic proportions
+```{r}
+# function to get entropy of topic distributon in every document in stm models
+get_entropy <- function(tm){
+    ent <- NULL
+    for (i in 1:length(tm$theta[,1])){
+        ent[i] <- Entropy(tm$theta[i,])
+    }
+    ent
+}
+
+# entropy for stm model on whole corpus
+entr_stm_all2 <- get_entropy(stm_all)
+
+# merge entropy with vars, regression on year and covariates
+vars <- cbind(vars,entr_stm_all2)
+vars <- vars %>% rename("entropy2"="...13")
+vars <- vars %>% mutate(year_num=as.numeric(year))
+
+save(vars, file="entropy_reg.Rdata")
+
+lm1 <- glm(entropy~1+slant,family=gaussian,data=vars)
+lm2 <- glm(entropy~1+slant+year_num,family=gaussian,data=vars)
+lm3 <- glm(entropy~1+slant+year_num+smokers,family=gaussian,data=vars)
+lm4 <- glm(entropy~1+slant+year_num+smokers+producer,family=gaussian,data=vars) # pseudo R^2 0.002
+
+PseudoR2(lm4)
+# lm5 <- plm(entropy~1+slant+year_num+smokers+producer,data=vars,index=c("state"),model="within")
+
+stargazer(lm1,lm2,lm3,lm4, type="text")
+
+# plot
+scatter.smooth(vars$slant,vars$entropy,family=c("gaussian"))
+loess.smooth(vars$year_num,vars$entropy,family=c("gaussian"))
+
+pcurve <- ggplot(vars,aes(slant,entropy))+xlim(0.38,0.57)+geom_smooth(method="loess")
+```
+
+
+# text embeddings
+
+
+## text embedding models
+CTM a python library with topic modelling by: whole sentence vectorisation with BERT embedding, extract keywords from tokens, clustering on keywords to obtain topics.BERTopic s similar.can map clusters back to classify sentences into topics, then count the number of topics present in article to obtain doc feature matrix.
+```{r}
+
+
+
+
+```
+
+## text embedding topic co-occurrence
+```{r}
+
+
+```
+
+## text embedding topic co-occurrence visualisation
+```{r}
+
+
+```
+
+# robustness check
+## permutation
+```{r}
+
+
+```
